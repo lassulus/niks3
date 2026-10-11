@@ -134,10 +134,17 @@ func PrepareClosures(ctx context.Context, topLevelPaths []string, pathInfos map[
 
 		pathInfoByHash[hash] = pathInfo
 
-		// Extract references as object keys (hash.narinfo)
+		// Extract references as object keys (hash.narinfo). A reference
+		// outside pathInfos was dropped by filterUpstreamPaths: the narinfo
+		// still lists it, but the cache holds no object for it, and the
+		// server rejects a push referencing objects it doesn't have.
 		var references []string
 
 		for _, ref := range pathInfo.References {
+			if _, ok := pathInfos[ref]; !ok {
+				continue
+			}
+
 			refHash, err := GetStorePathHash(ref)
 			if err != nil {
 				return nil, fmt.Errorf("getting reference hash: %w", err)
@@ -375,6 +382,67 @@ nextClosure:
 	return kept, prunedInfos, skipped
 }
 
+// filterUpstreamPaths drops the paths signed by one of the upstream keys
+// (key names like "cache.nixos.org-1"; a full "name:key" public key works
+// too). Such a path came from an upstream cache, which keeps serving it, so
+// uploading a copy only costs storage and time. References to dropped paths
+// stay in the narinfos; clients fetch those paths from the upstream cache.
+//
+// An upstream path only references upstream paths (the upstream built it),
+// so no path of our own becomes unreachable from the kept top-level paths.
+// It returns the kept top-level paths, the kept path infos and counts of what
+// was dropped.
+func filterUpstreamPaths(topLevelPaths []string, pathInfos map[string]*PathInfo, upstreamKeys []string) ([]string, map[string]*PathInfo, skippedUploads) {
+	if len(upstreamKeys) == 0 {
+		return topLevelPaths, pathInfos, skippedUploads{}
+	}
+
+	names := make(map[string]bool, len(upstreamKeys))
+	for _, key := range upstreamKeys {
+		name, _, _ := strings.Cut(key, ":")
+		names[name] = true
+	}
+
+	fromUpstream := func(info *PathInfo) bool {
+		for _, sig := range info.Signatures {
+			if name, _, _ := strings.Cut(sig, ":"); names[name] {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	kept := make(map[string]*PathInfo, len(pathInfos))
+
+	var skipped skippedUploads
+
+	for path, info := range pathInfos {
+		if fromUpstream(info) {
+			skipped.Paths++
+			skipped.NarBytes += info.NarSize
+
+			continue
+		}
+
+		kept[path] = info
+	}
+
+	if skipped.Paths == 0 {
+		return topLevelPaths, pathInfos, skippedUploads{}
+	}
+
+	keptTop := make([]string, 0, len(topLevelPaths))
+
+	for _, path := range topLevelPaths {
+		if _, ok := kept[path]; ok {
+			keptTop = append(keptTop, path)
+		}
+	}
+
+	return keptTop, kept, skipped
+}
+
 // createPending registers the closures with the server and returns the route
 // to sign and complete them on, plus the pending objects keyed by pending ID.
 // The server only signs narinfos that are pending for that specific ID, so
@@ -596,11 +664,23 @@ func (c *Client) PushPaths(ctx context.Context, paths []string) ([]string, error
 	slog.Debug("Found paths in closure", "count", len(pathInfos))
 
 	// Collect all closure paths to return to the caller. This includes paths
-	// from closures skipped by the size filter below, so callers (e.g. the
+	// dropped by the upstream and size filters below, so callers (e.g. the
 	// hook queue) treat them as handled instead of retrying forever.
 	closurePaths := make([]string, 0, len(pathInfos))
 	for storePath := range pathInfos {
 		closurePaths = append(closurePaths, storePath)
+	}
+
+	// Paths an upstream cache serves don't need a copy here.
+	var upstream skippedUploads
+
+	resolvedPaths, pathInfos, upstream = filterUpstreamPaths(resolvedPaths, pathInfos, c.IgnoreUpstreamKeys)
+	if upstream.Paths > 0 {
+		slog.Info(fmt.Sprintf("Skipping %d paths (%d bytes) signed by an upstream key", upstream.Paths, upstream.NarBytes))
+	}
+
+	if len(resolvedPaths) == 0 {
+		return closurePaths, nil
 	}
 
 	// Skip closures containing paths larger than the server's max NAR size.
