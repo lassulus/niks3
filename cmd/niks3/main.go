@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -22,6 +23,19 @@ func main() {
 		slog.Error("Fatal error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// stringSliceFlag implements flag.Value for repeatable string flags.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	return strings.Join(*s, ", ")
+}
+
+func (s *stringSliceFlag) Set(value string) error {
+	*s = append(*s, value)
+
+	return nil
 }
 
 func printUsage() {
@@ -61,6 +75,9 @@ func printPushHelp() {
 	fmt.Fprintln(os.Stderr, "        Maximum concurrent uploads (default: 30)")
 	fmt.Fprintln(os.Stderr, "  --verify-s3-integrity")
 	fmt.Fprintln(os.Stderr, "        Verify that objects in database actually exist in S3 before skipping upload")
+	fmt.Fprintln(os.Stderr, "  --ignore-upstream-key string")
+	fmt.Fprintln(os.Stderr, "        Don't upload paths signed by this key, e.g. cache.nixos.org-1: the")
+	fmt.Fprintln(os.Stderr, "        upstream cache serves them. Name or full public key. Repeatable.")
 	fmt.Fprintln(os.Stderr, cmdutil.TLSHelp)
 	fmt.Fprintln(os.Stderr, "  --debug")
 	fmt.Fprintln(os.Stderr, "        Enable debug logging (includes HTTP requests/responses)")
@@ -115,6 +132,10 @@ func run() error {
 		batchSize := pushCmd.Int("batch-size", client.DefaultStreamBatchSize, "Max paths per push with --stdin")
 		parallelPushes := pushCmd.Int("parallel-pushes", client.DefaultStreamParallel, "Concurrent pushes with --stdin")
 		retryTimeout := pushCmd.Duration("retry-timeout", 0, "Keep retrying a failing request for this long with --stdin")
+
+		var ignoreUpstream stringSliceFlag
+		pushCmd.Var(&ignoreUpstream, "ignore-upstream-key", "Don't upload paths signed by this key (repeatable)")
+
 		tf := cmdutil.AddTLSFlags(pushCmd)
 
 		ts, err := cmdutil.ParseCommand(pushCmd, cf, tf, os.Args[2:], printPushHelp)
@@ -129,7 +150,7 @@ func run() error {
 				return errors.New("--stdin takes no store path arguments and no --pin")
 			}
 
-			return pushStdinCommand(*cf.ServerURL, ts, *maxConcurrent, *parallelPushes, *batchSize, *retryTimeout, *verifyS3Integrity, *cf.Debug, tf)
+			return pushStdinCommand(*cf.ServerURL, ts, *maxConcurrent, *parallelPushes, *batchSize, *retryTimeout, *verifyS3Integrity, ignoreUpstream, *cf.Debug, tf)
 		}
 
 		if len(paths) == 0 {
@@ -140,7 +161,7 @@ func run() error {
 			return errors.New("--pin requires exactly one store path")
 		}
 
-		return pushCommand(*cf.ServerURL, ts, paths, *maxConcurrent, *verifyS3Integrity, *pinName, *cf.Debug, tf)
+		return pushCommand(*cf.ServerURL, ts, paths, *maxConcurrent, *verifyS3Integrity, ignoreUpstream, *pinName, *cf.Debug, tf)
 
 	case "gc":
 		gcCmd := flag.NewFlagSet("gc", flag.ContinueOnError)
@@ -203,7 +224,7 @@ func run() error {
 	}
 }
 
-func pushCommand(serverURL string, ts client.TokenSource, paths []string, maxConcurrent int, verifyS3Integrity bool, pinName string, debug bool, tf cmdutil.TLSFlags) error {
+func pushCommand(serverURL string, ts client.TokenSource, paths []string, maxConcurrent int, verifyS3Integrity bool, ignoreUpstream []string, pinName string, debug bool, tf cmdutil.TLSFlags) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -218,6 +239,7 @@ func pushCommand(serverURL string, ts client.TokenSource, paths []string, maxCon
 
 	c.MaxConcurrentNARUploads = maxConcurrent
 	c.VerifyS3Integrity = verifyS3Integrity
+	c.IgnoreUpstreamKeys = ignoreUpstream
 
 	defer c.WaitRegistrations()
 
@@ -243,7 +265,7 @@ func pushCommand(serverURL string, ts client.TokenSource, paths []string, maxCon
 	return nil
 }
 
-func pushStdinCommand(serverURL string, ts client.TokenSource, maxConcurrent, parallel, batchSize int, retryTimeout time.Duration, verifyS3Integrity bool, debug bool, tf cmdutil.TLSFlags) error {
+func pushStdinCommand(serverURL string, ts client.TokenSource, maxConcurrent, parallel, batchSize int, retryTimeout time.Duration, verifyS3Integrity bool, ignoreUpstream []string, debug bool, tf cmdutil.TLSFlags) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -258,6 +280,7 @@ func pushStdinCommand(serverURL string, ts client.TokenSource, maxConcurrent, pa
 
 	c.MaxConcurrentNARUploads = maxConcurrent
 	c.VerifyS3Integrity = verifyS3Integrity
+	c.IgnoreUpstreamKeys = ignoreUpstream
 	c.Retry.Timeout = retryTimeout
 
 	defer c.WaitRegistrations()
