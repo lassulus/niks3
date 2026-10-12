@@ -1,0 +1,63 @@
+name: rebase onto upstream
+
+# This fork carries a few commits on top of Mic92/niks3 (`git log
+# upstream/main..main`). Once a week they are rebased onto upstream main,
+# built and tested, and pushed. A conflict or a failing test fails the run
+# and leaves main alone.
+#
+# Pushes with a deploy key (REBASE_DEPLOY_KEY): upstream changes its
+# workflow files often, and GITHUB_TOKEN may not push those.
+#
+# Every rebased main is also tagged rebased/<date>-<sha>: flake.lock files
+# pin fork commits, which a rebase takes off main, and GitHub doesn't promise
+# to keep commits no ref points to.
+#
+# Upstream's own workflows are disabled in this fork (`gh workflow list --all`).
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rebase-upstream
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.REBASE_DEPLOY_KEY }}
+      - uses: cachix/install-nix-action@v31
+      - name: rebase
+        id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Mic92/niks3.git
+          git fetch upstream main
+          before=$(git rev-parse HEAD)
+          git rebase upstream/main
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "fork commits on top of upstream:"
+          git log --oneline upstream/main..HEAD
+      - name: test
+        run: |
+          nix build -L .#niks3
+          nix develop -c go test ./client/... ./cmd/...
+      - name: push
+        if: steps.rebase.outputs.changed == 'true'
+        run: |
+          tag=rebased/$(date -u +%Y-%m-%d)-$(git rev-parse --short HEAD)
+          git tag "$tag"
+          git push --atomic --force-with-lease=main:${{ steps.rebase.outputs.before }} origin HEAD:main "$tag"
